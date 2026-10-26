@@ -1,0 +1,845 @@
+name: Build APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Create project files
+        run: |
+          mkdir -p app/src/main/java/com/jarvis/app app/src/main/res/xml app/src/main/res/values
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "Jarvis"
+          include(":app")
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.jarvis.app'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.jarvis.app"
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 2
+                  versionName "2.0"
+                  ndk { abiFilters 'arm64-v8a' }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+              packaging {
+                  resources { excludes += '/META-INF/{AL2.0,LGPL2.1}' }
+              }
+          }
+          dependencies {
+              implementation 'com.google.mediapipe:tasks-genai:0.10.14'
+          }
+          EOF
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="lock_desc">Jarvis phone lock</string>
+          </resources>
+          EOF
+          cat > app/src/main/res/xml/lock_config.xml <<'EOF'
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:description="@string/lock_desc"
+              android:notificationTimeout="100"/>
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.READ_CONTACTS"/>
+              <uses-permission android:name="android.permission.CALL_PHONE"/>
+              <uses-permission android:name="android.permission.READ_PHONE_STATE"/>
+              <uses-permission android:name="android.permission.READ_CALL_LOG"/>
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN"/>
+                      <category android:name="android.intent.category.LAUNCHER"/>
+                  </intent>
+                  <intent>
+                      <action android:name="android.speech.RecognitionService"/>
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.TTS_SERVICE"/>
+                  </intent>
+              </queries>
+              <application
+                  android:label="Jarvis"
+                  android:largeHeap="true"
+                  android:theme="@android:style/Theme.Material.Light">
+                  <uses-native-library android:name="libOpenCL.so" android:required="false"/>
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".JarvisService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone"/>
+                  <service
+                      android:name=".LockService"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService"/>
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/lock_config"/>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/jarvis/app/LockService.kt <<'EOF'
+          package com.jarvis.app
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Intent
+          import android.view.accessibility.AccessibilityEvent
+
+          class LockService : AccessibilityService() {
+              companion object { var instance: LockService? = null }
+
+              override fun onServiceConnected() { instance = this }
+              override fun onUnbind(intent: Intent?): Boolean {
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+          }
+          EOF
+          cat > app/src/main/java/com/jarvis/app/MainActivity.kt <<'EOF'
+          package com.jarvis.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Context
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.Voice
+          import android.text.InputType
+          import android.view.Gravity
+          import android.widget.*
+          import java.io.File
+          import java.util.Locale
+
+          fun applyVoice(t: TextToSpeech?, p: SharedPreferences) {
+              if (t == null) return
+              t.language = Locale("hi", "IN")
+              val name = p.getString("voice", "") ?: ""
+              if (name.isNotEmpty()) {
+                  val v = try { t.voices?.firstOrNull { it.name == name } } catch (e: Exception) { null }
+                  if (v != null) t.voice = v
+              }
+              val st = p.getInt("style", 0).coerceIn(0, 2)
+              t.setSpeechRate(floatArrayOf(1.0f, 0.9f, 1.15f)[st])
+              t.setPitch(floatArrayOf(1.0f, 0.8f, 1.1f)[st])
+          }
+
+          class MainActivity : Activity(), TextToSpeech.OnInitListener {
+              private lateinit var prefs: SharedPreferences
+              private lateinit var etKey: EditText
+              private lateinit var etModels: EditText
+              private lateinit var etNotes: EditText
+              private lateinit var etAlias: EditText
+              private lateinit var spMode: Spinner
+              private lateinit var spVoice: Spinner
+              private lateinit var spStyle: Spinner
+              private lateinit var tvStatus: TextView
+              private lateinit var tvModel: TextView
+              private var tts: TextToSpeech? = null
+              private var voiceList: List<Voice> = emptyList()
+              private var copying = false
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  prefs = getSharedPreferences("jarvis", Context.MODE_PRIVATE)
+                  tts = TextToSpeech(this, this)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(40, 60, 40, 60)
+                  }
+                  fun lbl(t: String) {
+                      root.addView(TextView(this).apply { text = t; textSize = 16f; setPadding(0, 30, 0, 6) })
+                  }
+                  fun btn(t: String, f: () -> Unit) {
+                      root.addView(Button(this).apply { text = t; setOnClickListener { f() } })
+                  }
+                  fun edit(h: String, lines: Int): EditText {
+                      val e = EditText(this)
+                      e.hint = h
+                      e.minLines = lines
+                      if (lines > 1) {
+                          e.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                          e.gravity = Gravity.TOP
+                      }
+                      root.addView(e)
+                      return e
+                  }
+                  fun spin(items: List<String>): Spinner {
+                      val s = Spinner(this)
+                      s.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, items)
+                      root.addView(s)
+                      return s
+                  }
+
+                  root.addView(TextView(this).apply { text = "Jarvis 2.0"; textSize = 26f })
+                  tvStatus = TextView(this)
+                  root.addView(tvStatus)
+
+                  lbl("पहली बार का सेटअप (क्रम से दबाएँ)")
+                  btn("1. अनुमतियाँ दें") {
+                      requestPermissions(arrayOf(
+                          Manifest.permission.RECORD_AUDIO,
+                          Manifest.permission.READ_CONTACTS,
+                          Manifest.permission.CALL_PHONE,
+                          Manifest.permission.READ_PHONE_STATE,
+                          Manifest.permission.READ_CALL_LOG,
+                          "android.permission.POST_NOTIFICATIONS"
+                      ), 1)
+                  }
+                  btn("2. Accessibility खोलें (Jarvis चालू करें)") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  }
+                  btn("3. Overlay अनुमति दें") {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                          Uri.parse("package:$packageName")))
+                  }
+                  btn("4. ऐप सेटिंग (Battery: No restriction)") {
+                      startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                          Uri.parse("package:$packageName")))
+                  }
+
+                  lbl("AI मोड")
+                  spMode = spin(listOf(
+                      "ऑटो: नेट हो तो Gemini, वरना ऑफलाइन",
+                      "सिर्फ़ ऑनलाइन (Gemini)",
+                      "सिर्फ़ ऑफलाइन (मॉडल फ़ाइल)"))
+                  spMode.setSelection(prefs.getInt("mode", 0))
+
+                  lbl("Gemini API key")
+                  etKey = edit("AIza...", 1)
+                  etKey.setText(prefs.getString("key", ""))
+
+                  lbl("Gemini मॉडल का नाम (हर लाइन में एक। ऊपर वाला पहले चलेगा, एरर पर अगला)")
+                  etModels = edit("gemini-2.5-flash", 3)
+                  etModels.setText(prefs.getString("models", "gemini-2.5-flash"))
+
+                  lbl("ऑफलाइन AI मॉडल")
+                  tvModel = TextView(this)
+                  root.addView(tvModel)
+                  btn("📂 ऑफलाइन मॉडल फ़ाइल चुनें (.task)") {
+                      val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                      i.addCategory(Intent.CATEGORY_OPENABLE)
+                      i.type = "*/*"
+                      startActivityForResult(i, 77)
+                  }
+
+                  lbl("AI की आवाज़")
+                  spVoice = spin(listOf("लोड हो रही है..."))
+                  spStyle = spin(listOf("शैली 1: सामान्य", "शैली 2: गहरी और धीमी", "शैली 3: तेज़ और पतली"))
+                  spStyle.setSelection(prefs.getInt("style", 0))
+                  btn("🔊 आवाज़ टेस्ट करें") {
+                      saveAll()
+                      applyVoice(tts, prefs)
+                      tts?.speak("नमस्ते सर, मैं जार्विस हूँ। बताइए क्या करना है?",
+                          TextToSpeech.QUEUE_FLUSH, null, "t")
+                  }
+
+                  lbl("Notes (AI को आपके बारे में जो बताना है, जैसे नाम, दुकान, पसंद)")
+                  etNotes = edit("यहाँ लिखें...", 4)
+                  etNotes.setText(prefs.getString("notes", ""))
+
+                  lbl("अपने ऐप-नाम (हर लाइन में नाम=ऐप), जैसे: टीवी=YouTube")
+                  etAlias = edit("टीवी=YouTube", 4)
+                  etAlias.setText(prefs.getString("aliases", "टीवी=YouTube"))
+                  btn("➕ ऐप जोड़ें (लिस्ट से चुनें)") { pickApp() }
+
+                  btn("💾 सब सेव करें") {
+                      saveAll()
+                      Toast.makeText(this, "सेव हुआ", Toast.LENGTH_SHORT).show()
+                  }
+                  btn("▶ Jarvis शुरू करें (या दोबारा शुरू)") {
+                      saveAll()
+                      stopService(Intent(this, JarvisService::class.java))
+                      val i = Intent(this, JarvisService::class.java)
+                      if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+                  }
+                  btn("■ बंद करें") { stopService(Intent(this, JarvisService::class.java)) }
+                  setContentView(ScrollView(this).apply { addView(root) })
+              }
+
+              override fun onInit(s: Int) {
+                  val all = try { tts?.voices?.toList() ?: emptyList() } catch (e: Exception) { emptyList() }
+                  val hi = all.filter { it.locale.language == "hi" }
+                  voiceList = (if (hi.isNotEmpty()) hi else all).sortedBy { it.name }
+                  val names = voiceList.map { it.name + (if (it.isNetworkConnectionRequired) " (नेट)" else "") }
+                  runOnUiThread {
+                      spVoice.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item,
+                          if (names.isEmpty()) listOf("डिफ़ॉल्ट आवाज़") else names)
+                      val saved = prefs.getString("voice", "")
+                      val i = voiceList.indexOfFirst { it.name == saved }
+                      if (i >= 0) spVoice.setSelection(i)
+                  }
+              }
+
+              private fun saveAll() {
+                  val pos = spVoice.selectedItemPosition
+                  val vn = if (pos in voiceList.indices) voiceList[pos].name else ""
+                  prefs.edit()
+                      .putString("key", etKey.text.toString().trim())
+                      .putString("models", etModels.text.toString())
+                      .putString("notes", etNotes.text.toString())
+                      .putString("aliases", etAlias.text.toString())
+                      .putInt("mode", spMode.selectedItemPosition)
+                      .putString("voice", vn)
+                      .putInt("style", spStyle.selectedItemPosition)
+                      .apply()
+              }
+
+              private fun pickApp() {
+                  val pm = packageManager
+                  val apps = pm.queryIntentActivities(
+                      Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                      .map { it.loadLabel(pm).toString() }
+                      .distinct().sortedBy { it.lowercase() }
+                  AlertDialog.Builder(this).setTitle("कौन सा ऐप जोड़ना है?")
+                      .setItems(apps.toTypedArray()) { _, i ->
+                          val appName = apps[i]
+                          val et = EditText(this)
+                          et.hint = "बोलने का नाम (जैसे: इंस्टा)"
+                          AlertDialog.Builder(this).setTitle(appName).setView(et)
+                              .setPositiveButton("जोड़ें") { _, _ ->
+                                  val n = et.text.toString().trim()
+                                  if (n.isNotEmpty()) {
+                                      val cur = etAlias.text.toString().trimEnd()
+                                      etAlias.setText(if (cur.isEmpty()) "$n=$appName" else "$cur\n$n=$appName")
+                                      saveAll()
+                                  }
+                              }
+                              .setNegativeButton("रद्द", null).show()
+                      }.show()
+              }
+
+              override fun onActivityResult(rc: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(rc, res, data)
+                  val u = data?.data
+                  if (rc == 77 && res == RESULT_OK && u != null) copyModel(u)
+              }
+
+              private fun copyModel(u: Uri) {
+                  copying = true
+                  tvModel.text = "मॉडल कॉपी हो रहा है... रुकिए, कुछ मिनट लग सकते हैं"
+                  Thread {
+                      try {
+                          val out = File(filesDir, "model.task")
+                          contentResolver.openInputStream(u)!!.use { ins ->
+                              out.outputStream().use { os -> ins.copyTo(os) }
+                          }
+                          prefs.edit().putString("modelPath", out.absolutePath).apply()
+                          runOnUiThread { tvModel.text = "मॉडल तैयार: ${out.length() / 1048576} MB" }
+                      } catch (e: Exception) {
+                          runOnUiThread { tvModel.text = "कॉपी फ़ेल: ${e.message}" }
+                      }
+                      copying = false
+                  }.start()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  tvStatus.text = "स्थिति: " + (prefs.getString("status", "अभी कुछ नहीं") ?: "")
+                  if (!copying) {
+                      val p = prefs.getString("modelPath", "") ?: ""
+                      tvModel.text = if (p.isNotEmpty() && File(p).exists())
+                          "मॉडल तैयार: ${File(p).length() / 1048576} MB"
+                      else "कोई मॉडल फ़ाइल नहीं चुनी"
+                  }
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  saveAll()
+              }
+
+              override fun onDestroy() {
+                  tts?.shutdown()
+                  super.onDestroy()
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/jarvis/app/JarvisService.kt <<'EOF'
+          package com.jarvis.app
+
+          import android.app.*
+          import android.content.*
+          import android.content.pm.PackageManager
+          import android.content.pm.ServiceInfo
+          import android.net.ConnectivityManager
+          import android.net.NetworkCapabilities
+          import android.net.Uri
+          import android.os.*
+          import android.provider.ContactsContract
+          import android.speech.*
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import android.telephony.TelephonyManager
+          import com.google.mediapipe.tasks.genai.llminference.LlmInference
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.util.Locale
+
+          class AiResult(val text: String?, val err: String?)
+
+          class JarvisService : Service(), TextToSpeech.OnInitListener {
+              private var sr: SpeechRecognizer? = null
+              private var tts: TextToSpeech? = null
+              private val h = Handler(Looper.getMainLooper())
+              private val prefs by lazy { getSharedPreferences("jarvis", Context.MODE_PRIVATE) }
+              private var awaitUntil = 0L
+              private var pendingCall: String? = null
+              private var busy = false
+              private var inCall = false
+              private var running = false
+              private var lastRing = ""
+              private var llm: LlmInference? = null
+              private val history = ArrayList<Pair<String, String>>()
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  running = true
+                  return START_STICKY
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  running = true
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel("jarvis", "Jarvis", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, "jarvis")
+                      .setContentTitle("Jarvis सुन रहा है")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now).build()
+                  if (Build.VERSION.SDK_INT >= 29)
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  else startForeground(1, n)
+                  tts = TextToSpeech(this, this)
+                  val f = IntentFilter(TelephonyManager.ACTION_PHONE_STATE_CHANGED)
+                  if (Build.VERSION.SDK_INT >= 33)
+                      registerReceiver(callReceiver, f, Context.RECEIVER_EXPORTED)
+                  else registerReceiver(callReceiver, f)
+              }
+
+              override fun onInit(status: Int) {
+                  tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                      override fun onStart(id: String?) { busy = true }
+                      override fun onDone(id: String?) { busy = false; h.post { listen() } }
+                      override fun onError(id: String?) { busy = false; h.post { listen() } }
+                  })
+                  say("जार्विस तैयार है")
+              }
+
+              private fun say(t: String) {
+                  busy = true
+                  h.post { sr?.cancel() }
+                  applyVoice(tts, prefs)
+                  tts?.speak(t, TextToSpeech.QUEUE_FLUSH, null, "u")
+              }
+
+              private fun awaiting() = System.currentTimeMillis() < awaitUntil
+              private fun setAwait(ms: Long) { awaitUntil = System.currentTimeMillis() + ms }
+
+              private fun setStatus(s: String) {
+                  val tm = java.text.SimpleDateFormat("HH:mm:ss", Locale.US).format(java.util.Date())
+                  prefs.edit().putString("status", "$tm $s").apply()
+              }
+
+              private fun listen() {
+                  if (!running || busy || inCall) return
+                  try {
+                      if (sr == null) {
+                          sr = SpeechRecognizer.createSpeechRecognizer(this)
+                          sr!!.setRecognitionListener(object : RecognitionListener {
+                              override fun onResults(r: Bundle?) {
+                                  val t = r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                                      ?.firstOrNull()
+                                  if (t != null) handle(t)
+                                  h.postDelayed({ listen() }, 300)
+                              }
+                              override fun onError(e: Int) {
+                                  h.postDelayed({ listen() },
+                                      if (e == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 1500 else 500)
+                              }
+                              override fun onReadyForSpeech(p: Bundle?) {}
+                              override fun onBeginningOfSpeech() {}
+                              override fun onRmsChanged(v: Float) {}
+                              override fun onBufferReceived(b: ByteArray?) {}
+                              override fun onEndOfSpeech() {}
+                              override fun onPartialResults(p: Bundle?) {}
+                              override fun onEvent(t: Int, p: Bundle?) {}
+                          })
+                      }
+                      val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                          putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                              RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                          putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
+                          putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+                      }
+                      sr!!.cancel()
+                      sr!!.startListening(i)
+                  } catch (e: Exception) {
+                      h.postDelayed({ listen() }, 2000)
+                  }
+              }
+
+              private val lockAction =
+                  android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_LOCK_SCREEN
+
+              private fun handle(raw: String) {
+                  val low = raw.lowercase(Locale.ROOT).trim()
+                  if (pendingCall != null) {
+                      val num = pendingCall!!
+                      pendingCall = null
+                      val yes = listOf("हाँ", "हां", "haan", "yes", "लगाओ", "कर दो")
+                      if (yes.any { low.contains(it) }) callNow(num) else say("ठीक है, रद्द")
+                      return
+                  }
+                  var t = low
+                  var woke = false
+                  for (w in listOf("jarvis", "जार्विस", "जारविस", "hello", "हेलो", "हैलो")) {
+                      if (t.contains(w)) { woke = true; t = t.replace(w, " ") }
+                  }
+                  t = t.trim()
+                  if (!woke && !awaiting()) return
+                  awaitUntil = 0L
+                  if (t.isEmpty()) { setAwait(12000); say("हाँ बोलिए सर"); return }
+
+                  val stop = setOf("बस", "रुको", "स्टॉप", "stop", "धन्यवाद", "थैंक्स", "thanks")
+                  val words = t.split(" ")
+                  if (words.size <= 3 && words.any { it in stop }) {
+                      history.clear()
+                      say("ठीक है सर")
+                      return
+                  }
+                  val short = words.size <= 8
+                  when {
+                      short && (t.contains("लॉक") || t.contains("lock")) -> {
+                          val s = LockService.instance
+                          if (s != null) s.performGlobalAction(lockAction)
+                          else say("पहले Accessibility चालू करें")
+                      }
+                      short && (t.contains("कॉल") || t.contains("call") ||
+                          t.contains("फोन करो") || t.contains("फ़ोन करो")) -> makeCall(t)
+                      short && (t.contains("खोल") || t.contains("open") ||
+                          t.contains("ओपन") || t.contains("चालू करो")) -> openApp(t)
+                      else -> askAi(t)
+                  }
+              }
+
+              // ---------- AI ----------
+              private fun isOnline(): Boolean {
+                  val cm = getSystemService(ConnectivityManager::class.java)
+                  val n = cm.activeNetwork ?: return false
+                  val c = cm.getNetworkCapabilities(n) ?: return false
+                  return c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                      c.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+              }
+
+              private fun systemPrompt(): String {
+                  val notes = prefs.getString("notes", "") ?: ""
+                  return "तुम जार्विस हो, एक आवाज़ वाला सहायक। जिस भाषा में सवाल पूछा गया हो उसी में जवाब दो, ज़्यादातर हिंदी। " +
+                      "जवाब छोटा रखो (1 से 3 वाक्य), बोलकर सुनाने लायक, बिना markdown, बिना इमोजी, बिना सूची। " +
+                      "यूज़र को सर कहकर बुलाओ।" +
+                      (if (notes.isNotBlank()) "\nयूज़र के नोट्स (इन्हें याद रखकर इस्तेमाल करो):\n$notes" else "")
+              }
+
+              private fun askAi(q: String) {
+                  val mode = prefs.getInt("mode", 0)
+                  val online = isOnline()
+                  val hist = history.toList()
+                  if (mode == 2) say("सोच रहा हूँ")
+                  Thread {
+                      var res: AiResult
+                      if (mode == 2) {
+                          res = offlineAsk(q)
+                      } else if (mode == 1 || online) {
+                          res = if (online) geminiAsk(q, hist) else AiResult(null, "इंटरनेट नहीं है")
+                          if (res.text == null && mode == 0) {
+                              val off = offlineAsk(q)
+                              res = if (off.text != null) off
+                              else AiResult(null, res.err + " | ऑफलाइन: " + off.err)
+                          }
+                      } else {
+                          res = offlineAsk(q)
+                      }
+                      val fin = res
+                      h.post { reply(q, fin) }
+                  }.start()
+              }
+
+              private fun reply(q: String, r: AiResult) {
+                  val txt = r.text
+                  if (txt != null) {
+                      val t = txt.replace("*", "").replace("#", "").trim().take(900)
+                      history.add(Pair(q, t))
+                      while (history.size > 6) history.removeAt(0)
+                      setAwait(25000)
+                      setStatus("AI ठीक चला")
+                      say(t)
+                  } else {
+                      setStatus("AI एरर: " + r.err)
+                      say("AI में दिक्कत आई। ऐप खोलकर स्टेटस देखें")
+                  }
+              }
+
+              private fun geminiAsk(q: String, hist: List<Pair<String, String>>): AiResult {
+                  val key = prefs.getString("key", "") ?: ""
+                  if (key.isBlank()) return AiResult(null, "Gemini key नहीं डाली")
+                  val models = (prefs.getString("models", "gemini-2.5-flash") ?: "")
+                      .lines().map { it.trim() }.filter { it.isNotEmpty() }
+                      .ifEmpty { listOf("gemini-2.5-flash") }
+                  fun part(role: String, text: String): JSONObject =
+                      JSONObject().put("role", role)
+                          .put("parts", JSONArray().put(JSONObject().put("text", text)))
+                  val contents = JSONArray()
+                  for ((u, m) in hist) {
+                      contents.put(part("user", u))
+                      contents.put(part("model", m))
+                  }
+                  contents.put(part("user", q))
+                  val body = JSONObject()
+                      .put("systemInstruction", JSONObject().put("parts",
+                          JSONArray().put(JSONObject().put("text", systemPrompt()))))
+                      .put("contents", contents)
+                  var err = ""
+                  for (m in models) {
+                      try {
+                          val c = URL("https://generativelanguage.googleapis.com/v1beta/models/$m:generateContent")
+                              .openConnection() as HttpURLConnection
+                          c.requestMethod = "POST"
+                          c.connectTimeout = 10000
+                          c.readTimeout = 40000
+                          c.setRequestProperty("Content-Type", "application/json")
+                          c.setRequestProperty("x-goog-api-key", key)
+                          c.doOutput = true
+                          c.outputStream.use { it.write(body.toString().toByteArray()) }
+                          val code = c.responseCode
+                          val ok = code in 200..299
+                          val txt = (if (ok) c.inputStream else c.errorStream)
+                              ?.bufferedReader()?.use { it.readText() } ?: ""
+                          if (ok) {
+                              val parts = JSONObject(txt).getJSONArray("candidates")
+                                  .getJSONObject(0).getJSONObject("content").getJSONArray("parts")
+                              val sb = StringBuilder()
+                              for (i in 0 until parts.length()) sb.append(parts.getJSONObject(i).optString("text"))
+                              if (sb.isNotBlank()) return AiResult(sb.toString().trim(), null)
+                              err = "$m: खाली जवाब"
+                          } else {
+                              val msg = try {
+                                  JSONObject(txt).getJSONObject("error").optString("message").take(150)
+                              } catch (e: Exception) { txt.take(150) }
+                              err = "$m: HTTP $code $msg"
+                          }
+                      } catch (e: Exception) {
+                          err = "$m: ${e.javaClass.simpleName} ${e.message}"
+                      }
+                  }
+                  return AiResult(null, err)
+              }
+
+              private fun offlineAsk(q: String): AiResult {
+                  val path = prefs.getString("modelPath", "") ?: ""
+                  if (path.isEmpty() || !File(path).exists())
+                      return AiResult(null, "ऑफलाइन मॉडल फ़ाइल नहीं चुनी")
+                  return try {
+                      synchronized(this) {
+                          if (llm == null) {
+                              val o = LlmInference.LlmInferenceOptions.builder()
+                                  .setModelPath(path).setMaxTokens(1024).build()
+                              llm = LlmInference.createFromOptions(this, o)
+                          }
+                          val notes = (prefs.getString("notes", "") ?: "").take(600)
+                          val p = "<start_of_turn>user\n" +
+                              "तुम जार्विस हो, आवाज़ वाला सहायक। हिंदी में 1 से 2 वाक्य में छोटा जवाब दो, बिना markdown।" +
+                              (if (notes.isNotBlank()) "\nयूज़र के नोट्स: $notes" else "") +
+                              "\n\nसवाल: $q<end_of_turn>\n<start_of_turn>model\n"
+                          val out = llm!!.generateResponse(p).replace("<end_of_turn>", "").trim()
+                          if (out.isBlank()) AiResult(null, "ऑफलाइन: खाली जवाब") else AiResult(out, null)
+                      }
+                  } catch (t: Throwable) {
+                      AiResult(null, "ऑफलाइन: ${t.javaClass.simpleName} ${t.message}")
+                  }
+              }
+
+              // ---------- फ़ोन के काम ----------
+              private fun words(t: String, stop: Set<String>): String =
+                  t.split(" ").filter { it.isNotBlank() && it !in stop }.joinToString(" ")
+
+              private fun makeCall(t: String) {
+                  val digits = t.mapNotNull { c -> Character.digit(c, 10).takeIf { it >= 0 } }
+                      .joinToString("")
+                  if (digits.length >= 5) {
+                      pendingCall = digits
+                      say("${digits.toList().joinToString(" ")} पर कॉल लगाऊँ?")
+                      return
+                  }
+                  val name = words(t, setOf("कॉल", "call", "करो", "कर", "दो", "लगाओ", "को",
+                      "पर", "फोन", "फ़ोन", "नंबर", "number", "to"))
+                  val c = findContact(name)
+                  if (c == null) { say("$name नाम नहीं मिला"); return }
+                  pendingCall = c.second
+                  say("${c.first} को कॉल लगाऊँ?")
+              }
+
+              private fun findContact(name: String): Pair<String, String>? {
+                  if (name.isBlank() ||
+                      checkSelfPermission("android.permission.READ_CONTACTS")
+                      != PackageManager.PERMISSION_GRANTED) return null
+                  val c = contentResolver.query(
+                      ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                      arrayOf(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                          ContactsContract.CommonDataKinds.Phone.NUMBER),
+                      "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?",
+                      arrayOf("%$name%"), null)
+                  c?.use { if (it.moveToFirst()) return Pair(it.getString(0), it.getString(1)) }
+                  return null
+              }
+
+              private fun callNow(num: String) {
+                  try {
+                      startActivity(Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(num)))
+                          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                  } catch (e: Exception) {
+                      say("कॉल नहीं लग पाया, अनुमति देखें")
+                  }
+              }
+
+              private fun openApp(t: String) {
+                  val name = words(t, setOf("खोलो", "खोल", "open", "ओपन", "करो", "कर", "दो",
+                      "चालू", "को", "ऐप", "app"))
+                  val alias = (prefs.getString("aliases", "") ?: "").lines().mapNotNull {
+                      val p = it.split("=")
+                      if (p.size == 2) p[0].trim().lowercase() to p[1].trim().lowercase() else null
+                  }.toMap()
+                  val hi = mapOf("यूट्यूब" to "youtube", "व्हाट्सएप" to "whatsapp",
+                      "व्हाट्सऐप" to "whatsapp", "इंस्टाग्राम" to "instagram",
+                      "टेलीग्राम" to "telegram", "जीमेल" to "gmail", "क्रोम" to "chrome",
+                      "कैमरा" to "camera", "सेटिंग" to "settings", "सेटिंग्स" to "settings",
+                      "फोनपे" to "phonepe", "गूगल" to "google")
+                  var q = alias[name] ?: name
+                  q = hi[q] ?: q
+                  val pm = packageManager
+                  val list = pm.queryIntentActivities(
+                      Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                  val hit = list.firstOrNull { it.loadLabel(pm).toString().lowercase().contains(q) }
+                  val li = hit?.let { pm.getLaunchIntentForPackage(it.activityInfo.packageName) }
+                  if (li != null) {
+                      startActivity(li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                      say("खोल रहा हूँ")
+                  } else say("$name ऐप नहीं मिला")
+              }
+
+              private fun nameFor(num: String): String? {
+                  try {
+                      val u = Uri.withAppendedPath(
+                          ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(num))
+                      contentResolver.query(u, arrayOf(ContactsContract.PhoneLookup.DISPLAY_NAME),
+                          null, null, null)?.use { if (it.moveToFirst()) return it.getString(0) }
+                  } catch (e: Exception) {}
+                  return null
+              }
+
+              private val callReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context, i: Intent) {
+                      when (i.getStringExtra(TelephonyManager.EXTRA_STATE)) {
+                          TelephonyManager.EXTRA_STATE_RINGING -> {
+                              inCall = true
+                              h.post { sr?.cancel() }
+                              val num = i.getStringExtra(TelephonyManager.EXTRA_INCOMING_NUMBER)
+                                  ?: return
+                              if (num == lastRing) return
+                              lastRing = num
+                              val nm = nameFor(num)
+                              say(if (nm != null) "सर, $nm का फ़ोन आ रहा है"
+                                  else "सर, अननोन नंबर से फ़ोन आ रहा है")
+                          }
+                          TelephonyManager.EXTRA_STATE_OFFHOOK -> inCall = true
+                          TelephonyManager.EXTRA_STATE_IDLE -> {
+                              inCall = false
+                              lastRing = ""
+                              h.postDelayed({ listen() }, 1000)
+                          }
+                      }
+                  }
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  try { unregisterReceiver(callReceiver) } catch (e: Exception) {}
+                  try { llm?.close() } catch (e: Throwable) {}
+                  sr?.destroy()
+                  tts?.shutdown()
+                  super.onDestroy()
+              }
+          }
+          EOF
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+      - name: Build
+        run: |
+          gradle assembleDebug --console=plain > log.txt 2>&1 || { grep -n -E "^e: |ERROR:|error:|What went wrong|Execution failed" -A6 log.txt | head -60; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Jarvis-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
